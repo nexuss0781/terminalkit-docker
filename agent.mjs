@@ -1,16 +1,18 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { arch, cpus, freemem, hostname, loadavg, platform, totalmem } from "node:os";
 import { readFile, statfs, writeFile } from "node:fs/promises";
 
 const protocolVersion = "2";
 const agentVersion = "2.0.0";
-const controllerUrl = (process.env.CONTROLLER_URL || "").replace(/\/$/, "");
-const enrollmentToken = process.env.ENROLLMENT_TOKEN || "";
+const controllerUrl = "https://terminalkit.onrender.com";
 const port = Number(process.env.PORT || 8080);
 const statePath = process.env.AGENT_STATE_PATH || "/app/.agent-token";
+const bootstrapPath = process.env.AGENT_BOOTSTRAP_PATH || "/app/.agent-bootstrap";
 
-let agentToken = process.env.AGENT_TOKEN || "";
+let agentToken = "";
+let bootstrapSecret = "";
 let instanceId = "";
 let controllerQueue = Promise.resolve();
 const sessions = new Map();
@@ -32,7 +34,7 @@ async function readJson(req) {
 }
 
 function publicEndpoint() {
-  return (process.env.INSTANCE_PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || "").replace(/\/$/, "");
+  return (process.env.RENDER_EXTERNAL_URL || process.env.INSTANCE_PUBLIC_URL || "").replace(/\/$/, "");
 }
 
 function identity() {
@@ -98,13 +100,16 @@ function queueController(path, body) {
 async function enroll() {
   if (!agentToken) agentToken = await readFile(statePath, "utf8").catch(() => "");
   if (agentToken) return;
-  if (!controllerUrl || !enrollmentToken || !publicEndpoint()) {
-    throw new Error("CONTROLLER_URL, ENROLLMENT_TOKEN, and a public INSTANCE_PUBLIC_URL or RENDER_EXTERNAL_URL are required for first enrollment");
+  if (!bootstrapSecret) bootstrapSecret = await readFile(bootstrapPath, "utf8").catch(() => "");
+  if (!bootstrapSecret) {
+    bootstrapSecret = randomBytes(32).toString("base64url");
+    await writeFile(bootstrapPath, bootstrapSecret, { mode: 0o600 });
   }
-  const response = await fetch(`${controllerUrl}/api/agent/enroll`, {
+  if (!publicEndpoint()) throw new Error("Waiting for the Render public endpoint before automatic enrollment");
+  const response = await fetch(`${controllerUrl}/api/agent/auto-enroll`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ enrollmentToken, ...identity(), ...(await metrics()) }),
+    body: JSON.stringify({ bootstrapSecret, ...identity(), ...(await metrics()) }),
   });
   if (!response.ok) throw new Error(`Enrollment failed with ${response.status}`);
   const data = await response.json();
@@ -135,6 +140,11 @@ function launchSession({ sessionId, command }) {
 const server = createServer(async (req, res) => {
   const url = new URL(req.url || "/", `http://${req.headers.host}`);
   if (req.method === "GET" && url.pathname === "/v1/terminal-kit/health") return send(res, 200, { status: "online", protocolVersion, ...identity(), ...(await metrics()) });
+  if (req.method === "POST" && url.pathname === "/v1/terminal-kit/bootstrap") {
+    return req.headers["x-terminal-kit-bootstrap"] === bootstrapSecret
+      ? send(res, 202, { accepted: true, protocolVersion })
+      : send(res, 401, { error: "Unauthorized" });
+  }
   if (!authorized(req)) return send(res, 401, { error: "Unauthorized" });
   if (req.method === "POST" && url.pathname === "/v1/terminal-kit/sessions") {
     const body = await readJson(req);
@@ -154,10 +164,17 @@ const server = createServer(async (req, res) => {
 });
 
 async function start() {
-  await enroll();
-  await heartbeat();
-  setInterval(() => { void heartbeat(); }, 30_000).unref();
-  server.listen(port, "0.0.0.0");
+  await new Promise(resolve => server.listen(port, "0.0.0.0", resolve));
+  const synchronize = async () => {
+    try {
+      await enroll();
+      await heartbeat();
+    } catch (error) {
+      console.error("Terminal-Kit automatic enrollment is waiting:", error instanceof Error ? error.message : error);
+    }
+  };
+  await synchronize();
+  setInterval(() => { void synchronize(); }, 30_000).unref();
 }
 
 start().catch(error => { console.error(error); process.exit(1); });
