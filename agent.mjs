@@ -1,0 +1,163 @@
+import { createServer } from "node:http";
+import { spawn } from "node:child_process";
+import { arch, cpus, freemem, hostname, loadavg, platform, totalmem } from "node:os";
+import { readFile, statfs, writeFile } from "node:fs/promises";
+
+const protocolVersion = "2";
+const agentVersion = "2.0.0";
+const controllerUrl = (process.env.CONTROLLER_URL || "").replace(/\/$/, "");
+const enrollmentToken = process.env.ENROLLMENT_TOKEN || "";
+const port = Number(process.env.PORT || 8080);
+const statePath = process.env.AGENT_STATE_PATH || "/app/.agent-token";
+
+let agentToken = process.env.AGENT_TOKEN || "";
+let instanceId = "";
+let controllerQueue = Promise.resolve();
+const sessions = new Map();
+
+function send(res, status, body) {
+  res.writeHead(status, { "content-type": "application/json" });
+  res.end(JSON.stringify(body));
+}
+
+async function readText(req) {
+  let body = "";
+  for await (const chunk of req) body += chunk;
+  return body;
+}
+
+async function readJson(req) {
+  const body = await readText(req);
+  return body ? JSON.parse(body) : {};
+}
+
+function publicEndpoint() {
+  return (process.env.INSTANCE_PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || "").replace(/\/$/, "");
+}
+
+function identity() {
+  return { hostname: hostname(), agentVersion, osPlatform: platform(), architecture: arch(), instanceUrl: publicEndpoint() };
+}
+
+async function metrics() {
+  const totalMemory = totalmem();
+  const usedMemory = totalMemory - freemem();
+  const cpuCount = Math.max(1, cpus().length);
+  let diskTotalMb = 0;
+  let diskFreeMb = 0;
+  try {
+    const disk = await statfs("/");
+    diskTotalMb = Math.round(Number(disk.blocks) * Number(disk.bsize) / 1024 / 1024);
+    diskFreeMb = Math.round(Number(disk.bfree) * Number(disk.bsize) / 1024 / 1024);
+  } catch {}
+  return {
+    cpuCount,
+    cpuPercent: Math.min(100, Math.round((loadavg()[0] / cpuCount) * 100)),
+    memoryPercent: Math.round((usedMemory / totalMemory) * 100),
+    memoryTotalMb: Math.round(totalMemory / 1024 / 1024),
+    diskPercent: diskTotalMb ? Math.round(((diskTotalMb - diskFreeMb) / diskTotalMb) * 100) : 0,
+    diskTotalMb,
+    diskFreeMb,
+  };
+}
+
+function authorized(req) {
+  return Boolean(agentToken) && req.headers.authorization === `Bearer ${agentToken}`;
+}
+
+function wait(milliseconds) {
+  return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+async function notifyController(path, body, retries = 3) {
+  let lastError;
+  for (let attempt = 1; attempt <= retries; attempt += 1) {
+    try {
+      if (!controllerUrl || !agentToken) throw new Error("Agent is not enrolled");
+      const response = await fetch(`${controllerUrl}${path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${agentToken}` },
+        body: JSON.stringify(body),
+      });
+      if (!response.ok) throw new Error(`Controller returned ${response.status}`);
+      return;
+    } catch (error) {
+      lastError = error;
+      if (attempt < retries) await wait(attempt * 500);
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error("Controller delivery failed");
+}
+
+function queueController(path, body) {
+  const report = controllerQueue.then(() => notifyController(path, body));
+  controllerQueue = report.catch(error => console.error("Terminal-Kit controller delivery failed:", error.message));
+  return report;
+}
+
+async function enroll() {
+  if (!agentToken) agentToken = await readFile(statePath, "utf8").catch(() => "");
+  if (agentToken) return;
+  if (!controllerUrl || !enrollmentToken || !publicEndpoint()) {
+    throw new Error("CONTROLLER_URL, ENROLLMENT_TOKEN, and a public INSTANCE_PUBLIC_URL or RENDER_EXTERNAL_URL are required for first enrollment");
+  }
+  const response = await fetch(`${controllerUrl}/api/agent/enroll`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ enrollmentToken, ...identity(), ...(await metrics()) }),
+  });
+  if (!response.ok) throw new Error(`Enrollment failed with ${response.status}`);
+  const data = await response.json();
+  agentToken = data.agentToken;
+  instanceId = String(data.instanceId);
+  await writeFile(statePath, agentToken, { mode: 0o600 });
+}
+
+async function heartbeat() {
+  if (!agentToken) return;
+  await queueController("/api/agent/heartbeat", { instanceId, ...identity(), ...(await metrics()) });
+}
+
+function launchSession({ sessionId, command }) {
+  const child = spawn("script", ["-qfec", command, "/dev/null"], { stdio: ["pipe", "pipe", "pipe"] });
+  const session = { child, sequence: 0 };
+  sessions.set(sessionId, session);
+  const emit = (kind, chunk) => queueController(`/api/agent/sessions/${sessionId}/events`, { kind, payload: chunk.toString(), sequence: ++session.sequence });
+  child.stdout.on("data", chunk => { void emit("stdout", chunk); });
+  child.stderr.on("data", chunk => { void emit("stderr", chunk); });
+  child.on("error", error => { void emit("stderr", error.message); });
+  child.on("close", code => {
+    sessions.delete(sessionId);
+    void queueController(`/api/agent/sessions/${sessionId}/complete`, { exitCode: code ?? 1 });
+  });
+}
+
+const server = createServer(async (req, res) => {
+  const url = new URL(req.url || "/", `http://${req.headers.host}`);
+  if (req.method === "GET" && url.pathname === "/v1/terminal-kit/health") return send(res, 200, { status: "online", protocolVersion, ...identity(), ...(await metrics()) });
+  if (!authorized(req)) return send(res, 401, { error: "Unauthorized" });
+  if (req.method === "POST" && url.pathname === "/v1/terminal-kit/sessions") {
+    const body = await readJson(req);
+    if (!body.sessionId || !body.command) return send(res, 400, { error: "sessionId and command are required" });
+    launchSession(body);
+    return send(res, 202, { accepted: true });
+  }
+  const inputMatch = url.pathname.match(/^\/v1\/terminal-kit\/sessions\/([^/]+)\/stdin$/);
+  if (req.method === "POST" && inputMatch) {
+    const body = await readJson(req);
+    const session = sessions.get(inputMatch[1]);
+    if (!session) return send(res, 404, { error: "Session not found" });
+    session.child.stdin.write(String(body.input ?? ""));
+    return send(res, 202, { accepted: true });
+  }
+  return send(res, 404, { error: "Not found" });
+});
+
+async function start() {
+  await enroll();
+  await heartbeat();
+  setInterval(() => { void heartbeat(); }, 30_000).unref();
+  server.listen(port, "0.0.0.0");
+}
+
+start().catch(error => { console.error(error); process.exit(1); });
