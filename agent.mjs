@@ -97,6 +97,18 @@ function queueController(path, body) {
   return report;
 }
 
+export function createOrderedStdinWriter(stdin) {
+  let queue = Promise.resolve();
+  return input => {
+    const write = queue.then(() => new Promise((resolve, reject) => {
+      if (!stdin.writable) return reject(new Error("Terminal stdin is closed"));
+      stdin.write(input, error => error ? reject(error) : resolve());
+    }));
+    queue = write.catch(() => undefined);
+    return write;
+  };
+}
+
 async function enroll() {
   if (!agentToken) agentToken = await readFile(statePath, "utf8").catch(() => "");
   if (agentToken) return;
@@ -125,7 +137,7 @@ async function heartbeat() {
 
 function launchSession({ sessionId, command }) {
   const child = spawn("script", ["-qfec", command, "/dev/null"], { stdio: ["pipe", "pipe", "pipe"] });
-  const session = { child, sequence: 0 };
+  const session = { child, sequence: 0, writeInput: createOrderedStdinWriter(child.stdin) };
   sessions.set(sessionId, session);
   const emit = (kind, chunk) => queueController(`/api/agent/sessions/${sessionId}/events`, { kind, payload: chunk.toString(), sequence: ++session.sequence });
   child.stdout.on("data", chunk => { void emit("stdout", chunk); });
@@ -157,8 +169,12 @@ const server = createServer(async (req, res) => {
     const body = await readJson(req);
     const session = sessions.get(inputMatch[1]);
     if (!session) return send(res, 404, { error: "Session not found" });
-    session.child.stdin.write(String(body.input ?? ""));
-    return send(res, 202, { accepted: true });
+    try {
+      await session.writeInput(String(body.input ?? ""));
+      return send(res, 202, { accepted: true });
+    } catch (error) {
+      return send(res, 409, { error: error instanceof Error ? error.message : "Terminal stdin is unavailable" });
+    }
   }
   return send(res, 404, { error: "Not found" });
 });
@@ -177,4 +193,4 @@ async function start() {
   setInterval(() => { void synchronize(); }, 30_000).unref();
 }
 
-start().catch(error => { console.error(error); process.exit(1); });
+if (process.env.TERMINAL_KIT_TEST !== "1") start().catch(error => { console.error(error); process.exit(1); });
